@@ -1,0 +1,13 @@
+../Core/Src/mpu6050.c:19:13:MPU_DelayUs	2
+../Core/Src/mpu6050.c:26:13:SDA_HIGH	1
+../Core/Src/mpu6050.c:28:13:SCL_HIGH	1
+../Core/Src/mpu6050.c:27:13:SDA_LOW	1
+../Core/Src/mpu6050.c:39:13:I2C_Stop	1
+../Core/Src/mpu6050.c:29:13:SCL_LOW	1
+../Core/Src/mpu6050.c:32:13:I2C_Start	1
+../Core/Src/mpu6050.c:46:16:I2C_WriteByte.isra	3
+../Core/Src/mpu6050.c:64:16:I2C_ReadByte	3
+../Core/Src/mpu6050.c:108:9:MPU6050_ReadGyroZ_Raw	1
+../Core/Src/mpu6050.c:82:6:MPU6050_Init	2
+../Core/Src/mpu6050.c:124:7:MPU6050_ReadGyroZ_DPS	1
+../Core/Src/mpu6050.c:130:9:MPU6050_ReadRegister	1
