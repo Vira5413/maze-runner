@@ -86,7 +86,7 @@ typedef struct {
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define CRASH_SAFETY_CM 5
+#define CRASH_SAFETY_CM 3
 
 /* USER CODE END PD */
 
@@ -116,6 +116,10 @@ static const ultrasonic_hw_t ultrasonics[_TOTAL_US] = {
 // Centralized encoder arrays
 volatile uint32_t encoder_counts[_TOTAL_ENC] = {0, 0};
 volatile uint32_t encoder_totals[_TOTAL_ENC] = {0, 0};
+
+// Ideal corridor half-width (cm), updated dynamically whenever both side
+// walls are in range. Used as fallback target when only one wall is seen.
+static int32_t corridor_target_cm = 12;
 
 /* USER CODE END PV */
 
@@ -149,13 +153,17 @@ uint32_t encoder_get_total(encoder_e enc);
 
 uint32_t ultrasonic_read(ultrasonic_e sensor);
 
+static int32_t compute_centering_correction(uint32_t left_us, uint32_t right_us,
+                                            uint32_t enc_left_delta,
+                                            uint32_t enc_right_delta);
+void drive_guided(uint32_t target_pulses);
+void drive_reacquire_corridor(turn_dir_e pref_dir);
+
 void drive_dist(uint32_t target_pulses, motor_dir_e dir);
 void turn_in_place(float target_angle_deg, turn_dir_e dir);
 
 void drive_until_wall_reengaged(turn_dir_e pref_dir);
 maze_event_e drive_to_intersection(void);
-void algo_right_wall_step(void);
-void algo_left_wall_step(void);
 void maze_solve_step(maze_algo_e active_algo);
 /* USER CODE END PFP */
 
@@ -571,15 +579,20 @@ uint32_t ultrasonic_read(ultrasonic_e sensor) {
   return pulseMicros / 58;
 }
 
-// GENRIC
+// Application
 
 /**
- * @brief Drives the car forward for a specified number of encoder pulses.
- *        Stops immediately if an obstacle is detected within CRASH_SAFETY_CM.
+ * @brief Drives a fixed distance with only encoder cross-track PID, no
+ *        ultrasonic centering. DEPRECATED for forward corridor travel — use
+ *        drive_guided() instead, which is what caused the post-turn wall
+ *        collisions. Kept only because it's the one primitive that supports
+ *        _DIR_REVERSE.
  * @param target_pulses The distance to travel, measured in encoder ticks.
  * @param dir Direction of travel (_DIR_FORWARD or _DIR_REVERSE).
  */
+
 void drive_dist(uint32_t target_pulses, motor_dir_e dir) {
+
   // Record starting encoder totals
   uint32_t start_left = encoder_get_total(_ENC_LEFT);
   uint32_t start_right = encoder_get_total(_ENC_RIGHT);
@@ -595,11 +608,11 @@ void drive_dist(uint32_t target_pulses, motor_dir_e dir) {
   uint32_t watchdog_start = HAL_GetTick();
   // Dynamic timeout: Give it 5ms per pulse, plus a 1.5-second base allowance
   uint32_t watchdog_timeout_ms = (target_pulses * 5) + 1500;
-
   uint32_t last_us_check = HAL_GetTick();
   uint8_t us_poll_target = 0; // 0: Front, 1: Left, 2: Right
 
   while (1) {
+
     uint32_t now = HAL_GetTick();
 
     // Software Watchdog Check
@@ -626,7 +639,6 @@ void drive_dist(uint32_t target_pulses, motor_dir_e dir) {
       if (dist <= CRASH_SAFETY_CM) {
         break;
       }
-
       us_poll_target = (us_poll_target + 1) % 3;
     }
 
@@ -647,10 +659,15 @@ void drive_dist(uint32_t target_pulses, motor_dir_e dir) {
     int32_t right_speed = BASE_SPEED + correction;
 
     // If one wheel finishes early, stop it while the other catches up
-    if (current_left >= target_pulses)
+    if (current_left >= target_pulses){
       left_speed = 0;
-    if (current_right >= target_pulses)
+    }
+
+
+    if (current_right >= target_pulses){
       right_speed = 0;
+    }
+
 
     motor_set_speed(_MOTOR_L, left_speed);
     motor_set_speed(_MOTOR_R, right_speed);
@@ -662,48 +679,55 @@ void drive_dist(uint32_t target_pulses, motor_dir_e dir) {
   // Active braking to stop momentum instantly
   motor_set_dir(_MOTOR_L, _DIR_BRAKE);
   motor_set_dir(_MOTOR_R, _DIR_BRAKE);
+
   motor_set_speed(_MOTOR_L, 0);
   motor_set_speed(_MOTOR_R, 0);
 
   // Hold brake briefly, then release to coast so motors aren't held under load
   HAL_Delay(100);
+
   motor_set_dir(_MOTOR_L, _DIR_COAST);
   motor_set_dir(_MOTOR_R, _DIR_COAST);
 }
 
 /**
+
  * @brief Rotates the car in place by a specified angle using gyro integration.
  * @param target_angle_deg The angle to turn in degrees.
  * @param dir The direction to turn (TURN_LEFT or TURN_RIGHT).
  */
 void turn_in_place(float target_angle_deg, turn_dir_e dir) {
 
-  // Chassis Clearance Nudge
+  // @Patch: Chassis Clearance Nudge
   // Advance half the body length (8cm) to prevent bumper clipping during
-  // rotation. 8 cm / 1.021 cm/pulse = ~8 pulses.
-  drive_dist(8, _DIR_FORWARD);
-
+  // rotation. 8 cm / 1.021 cm/pulse = ~8 pulses. Guided (not blind) so the
+  // car stays centered right up to the pivot point.
+  drive_guided(8);
   // Pause briefly to let the chassis settle and prevent gyro motion artifacts
   HAL_Delay(500);
 
   float turn_sum = 0.0f;
+
   uint32_t last_gyro_check = HAL_GetTick();
   uint32_t last_control_time = HAL_GetTick();
 
   // Reset local encoder tracking to synchronize wheel speeds during the turn
+
   uint32_t start_left = encoder_get_total(_ENC_LEFT);
   uint32_t start_right = encoder_get_total(_ENC_RIGHT);
 
   // Dynamic speed parameters
   const uint32_t MIN_SPEED = 350; // Minimum PWM to overcome motor stall torque
   const uint32_t MAX_SPEED = 500;
+
   const float Kp_angle = 5.0f; // Proportional gain for deceleration
-  const float Kp_enc = 30.0f;  // Proportional gain for wheel speed matching
+  const float Kp_enc = 30.0f; // Proportional gain for wheel speed matching
 
   // Set opposite wheel directions for a zero-radius turn
   if (dir == _TURN_RIGHT) {
     motor_set_dir(_MOTOR_L, _DIR_FORWARD);
     motor_set_dir(_MOTOR_R, _DIR_REVERSE);
+
   } else {
     motor_set_dir(_MOTOR_L, _DIR_REVERSE);
     motor_set_dir(_MOTOR_R, _DIR_FORWARD);
@@ -714,14 +738,13 @@ void turn_in_place(float target_angle_deg, turn_dir_e dir) {
   // braking.
   const float c_offset = 17.0f;
   float target_ang = target_angle_deg - c_offset;
+
   while (fabsf(turn_sum) < target_ang) {
     uint32_t now = HAL_GetTick();
-
     //  Gyro Integration (Read every ~2ms)
     if (now - last_gyro_check >= 2) {
       float dt = (now - last_gyro_check) * 0.001f; // Convert ms to seconds
       last_gyro_check = now;
-
       // Integrate Z-axis degrees-per-second into total degrees
       turn_sum += MPU6050_ReadGyroZ_DPS() * dt;
     }
@@ -732,12 +755,16 @@ void turn_in_place(float target_angle_deg, turn_dir_e dir) {
 
       // Calculate base speed proportionally based on remaining angle
       float angle_remaining = target_angle_deg - fabsf(turn_sum);
+
       uint32_t base_speed = (uint32_t)(angle_remaining * Kp_angle);
 
-      if (base_speed > MAX_SPEED)
+      if (base_speed > MAX_SPEED){
         base_speed = MAX_SPEED;
-      if (base_speed < MIN_SPEED)
+      }
+
+      if (base_speed < MIN_SPEED){
         base_speed = MIN_SPEED;
+      }
 
       // Encoder synchronization to prevent the pivot point from drifting
       uint32_t current_left = encoder_get_total(_ENC_LEFT) - start_left;
@@ -767,298 +794,225 @@ void turn_in_place(float target_angle_deg, turn_dir_e dir) {
   // resistance
   motor_set_dir(_MOTOR_L, _DIR_COAST);
   motor_set_dir(_MOTOR_R, _DIR_COAST);
+
 }
 
-void turn_in_place_2(float target_angle_deg, turn_dir_e dir) {
+/**
+ * @brief Shared centering law: cross-track error from side ultrasonics when a
+ *        wall is present, falling back to encoder cross-track error in open
+ *        space. Dynamically updates corridor_target_cm whenever both walls
+ *        are seen, so single-wall tracking uses a fresh half-width instead of
+ *        a hardcoded guess.
+ */
+static int32_t compute_centering_correction(uint32_t left_us, uint32_t right_us,
+                                            uint32_t enc_left_delta,
+                                            uint32_t enc_right_delta) {
 
-  // Chassis Clearance Nudge
-  // Advance half the body length (8cm) to prevent bumper clipping during
-  // rotation. 8 cm / 1.021 cm/pulse = ~8 pulses.
-  drive_dist(16, _DIR_FORWARD);
+  const uint32_t OPENING_THRESHOLD_CM = 20;
+  const int32_t DEADBAND_CM = 2;
 
-  // Let the chassis settle before reading the gyro
-  HAL_Delay(250);
-
-  float turn_sum = 0.0f;
-  uint32_t last_gyro_check = HAL_GetTick();
-  uint32_t last_control_time = HAL_GetTick();
-
-  uint32_t start_left = encoder_get_total(_ENC_LEFT);
-  uint32_t start_right = encoder_get_total(_ENC_RIGHT);
-
-  const uint32_t MIN_SPEED = 350;
-  const uint32_t MAX_SPEED = 500;
-  const float Kp_angle = 5.0f;
+  const float Kp_center = 30.0f;
   const float Kp_enc = 30.0f;
 
-  if (dir == _TURN_RIGHT) {
-    motor_set_dir(_MOTOR_L, _DIR_FORWARD);
-    motor_set_dir(_MOTOR_R, _DIR_REVERSE);
+  int32_t center_error = 0;
+  uint8_t use_encoder_pid = 0;
+
+  if (left_us < OPENING_THRESHOLD_CM && right_us < OPENING_THRESHOLD_CM) {
+    corridor_target_cm = ((int32_t)left_us + (int32_t)right_us) / 2;
+    center_error = (int32_t)left_us - (int32_t)right_us;
+
+  } else if (left_us < OPENING_THRESHOLD_CM) {
+    center_error = (int32_t)left_us - corridor_target_cm;
+
+  } else if (right_us < OPENING_THRESHOLD_CM) {
+    center_error = corridor_target_cm - (int32_t)right_us;
+
   } else {
-    motor_set_dir(_MOTOR_L, _DIR_REVERSE);
-    motor_set_dir(_MOTOR_R, _DIR_FORWARD);
+    use_encoder_pid = 1;
   }
 
-  // Reduced offset: Rely on active braking rather than pre-emptive cutoff
-  const float c_offset = 17.0f;
-  float target_ang = target_angle_deg - c_offset;
-
-  while (fabsf(turn_sum) < target_ang) {
-    uint32_t now = HAL_GetTick();
-
-    if (now - last_gyro_check >= 2) {
-      float dt = (now - last_gyro_check) * 0.001f;
-      last_gyro_check = now;
-      turn_sum += MPU6050_ReadGyroZ_DPS() * dt;
-    }
-
-    if (now - last_control_time >= 1) {
-      last_control_time = now;
-
-      float angle_remaining = target_angle_deg - fabsf(turn_sum);
-      uint32_t base_speed = (uint32_t)(angle_remaining * Kp_angle);
-
-      if (base_speed > MAX_SPEED)
-        base_speed = MAX_SPEED;
-      if (base_speed < MIN_SPEED)
-        base_speed = MIN_SPEED;
-
-      uint32_t current_left = encoder_get_total(_ENC_LEFT) - start_left;
-      uint32_t current_right = encoder_get_total(_ENC_RIGHT) - start_right;
-
-      int32_t enc_error = (int32_t)current_left - (int32_t)current_right;
-      int32_t correction = (int32_t)(Kp_enc * (float)enc_error);
-
-      motor_set_speed(_MOTOR_L, (int32_t)base_speed - correction);
-      motor_set_speed(_MOTOR_R, (int32_t)base_speed + correction);
-    }
+  if (use_encoder_pid) {
+    int32_t enc_error = (int32_t)enc_left_delta - (int32_t)enc_right_delta;
+    return (int32_t)(Kp_enc * (float)enc_error);
   }
 
-  motor_set_dir(_MOTOR_L, _DIR_BRAKE);
-  motor_set_dir(_MOTOR_R, _DIR_BRAKE);
-  motor_set_speed(_MOTOR_L, 0);
-  motor_set_speed(_MOTOR_R, 0);
-
-  HAL_Delay(100);
-  motor_set_dir(_MOTOR_L, _DIR_COAST);
-  motor_set_dir(_MOTOR_R, _DIR_COAST);
-}
-
-
-
-/**
- * @brief Drives straight until the preferred wall is detected again or front is
- * blocked.
- * @param pref_dir The wall we are trying to re-engage (_TURN_RIGHT or
- * _TURN_LEFT).
- */
-void drive_until_wall_reengaged(turn_dir_e pref_dir) {
-  uint32_t start_left = encoder_get_total(_ENC_LEFT);
-  uint32_t start_right = encoder_get_total(_ENC_RIGHT);
-
-  motor_set_dir(_MOTOR_L, _DIR_FORWARD);
-  motor_set_dir(_MOTOR_R, _DIR_FORWARD);
-
-  const uint32_t BASE_SPEED = 400;
-  const float Kp_enc = 30.0f;
-  const uint32_t REENGAGE_THRESHOLD_CM =
-      10; // Closer than this means we found the wall again
-  const uint32_t STOP_DISTANCE_CM = 6;
-
-  ultrasonic_e pref_sensor = (pref_dir == _TURN_RIGHT) ? _US_RIGHT : _US_LEFT;
-
-  uint32_t last_us_check = HAL_GetTick();
-  uint8_t us_poll_target = 0; // 0 = Pref Sensor, 1 = Front Sensor
-
-  while (1) {
-    uint32_t now = HAL_GetTick();
-
-    // 1. Environmental Polling (Toggle between front and preferred side only)
-    if (now - last_us_check >= 10) {
-      last_us_check = now;
-
-      if (us_poll_target == 0) {
-        if (ultrasonic_read(pref_sensor) < REENGAGE_THRESHOLD_CM) {
-          break; // Wall successfully found!
-        }
-      } else {
-        if (ultrasonic_read(_US_FRONT) <= STOP_DISTANCE_CM) {
-          break; // Hit a T-junction or dead end before wall returned
-        }
-      }
-      us_poll_target = (us_poll_target + 1) % 2;
-    }
-
-    // 2. Encoder Straight-Line PID
-    uint32_t current_left = encoder_get_total(_ENC_LEFT);
-    uint32_t current_right = encoder_get_total(_ENC_RIGHT);
-
-    int32_t error = (int32_t)(current_left - start_left) -
-                    (int32_t)(current_right - start_right);
-    int32_t correction = (int32_t)(Kp_enc * (float)error);
-
-    motor_set_speed(_MOTOR_L, BASE_SPEED - correction);
-    motor_set_speed(_MOTOR_R, BASE_SPEED + correction);
-
-    HAL_Delay(1);
+  if (center_error >= -DEADBAND_CM && center_error <= DEADBAND_CM) {
+    center_error = 0;
   }
 
-  // Active Braking
-  motor_set_dir(_MOTOR_L, _DIR_BRAKE);
-  motor_set_dir(_MOTOR_R, _DIR_BRAKE);
-  motor_set_speed(_MOTOR_L, 0);
-  motor_set_speed(_MOTOR_R, 0);
-  HAL_Delay(100);
-  motor_set_dir(_MOTOR_L, _DIR_COAST);
-  motor_set_dir(_MOTOR_R, _DIR_COAST);
+  return (int32_t)(Kp_center * (float)center_error);
 }
 
 /**
- * @brief Drives forward until an opening or a wall is detected.
- *        Traps system if motors stall for > 500ms.
- * @return The detected maze event.
+
+ * @brief Universal guided translation. Drives forward exactly target_pulses
+ *        while continuously running the ultrasonic centering PID (falls back
+ *        to encoder cross-track PID in open space). Replaces every blind
+ *        encoder-only forward move, including the post-turn advance, so the
+ *        car never drifts diagonally into a wall before centering kicks in.
+ * @param target_pulses Distance to travel, in encoder ticks. 0 = no-op.
  */
-maze_event_e drive_to_intersection(void) {
-  uint32_t start_left = encoder_get_total(_ENC_LEFT);
-  uint32_t start_right = encoder_get_total(_ENC_RIGHT);
 
-  // Watchdog variables
-  uint32_t last_left_count = start_left;
-  uint32_t last_right_count = start_right;
-  uint32_t last_movement_time = HAL_GetTick();
-  const uint32_t STALL_TIMEOUT_MS = 500;
+void drive_guided(uint32_t target_pulses) {
 
-  motor_set_dir(_MOTOR_L, _DIR_FORWARD);
-  motor_set_dir(_MOTOR_R, _DIR_FORWARD);
+  if (target_pulses == 0)
 
-  const uint32_t BASE_SPEED = 400;
-  const float Kp = 30.0f;
-  const uint32_t WALL_DETECT_CM = 25;
-  const uint32_t STOP_DISTANCE_CM = 5;
+    return;
 
-  uint32_t last_us_check = HAL_GetTick();
-  uint8_t us_poll_target = 0;
-  maze_event_e detected_event = _MAZE_EVENT_ERROR;
-
-  while (1) {
-    uint32_t now = HAL_GetTick();
-
-    uint32_t current_left = encoder_get_total(_ENC_LEFT);
-    uint32_t current_right = encoder_get_total(_ENC_RIGHT);
-
-    //  Stall-Detecting Software Watchdog
-    if (current_left != last_left_count || current_right != last_right_count) {
-      last_left_count = current_left;
-      last_right_count = current_right;
-      last_movement_time = now; // Reset timer as long as wheels are moving
-    }
-
-    if (now - last_movement_time > STALL_TIMEOUT_MS) {
-      Error_Handler(); // Trap if wheels stop turning for 500ms
-    }
-
-    //  Environmental Polling (Round-robin)
-    if (now - last_us_check >= 5) {
-      last_us_check = now;
-
-      if (us_poll_target == 0) {
-        if (ultrasonic_read(_US_FRONT) <= STOP_DISTANCE_CM) {
-          detected_event = _MAZE_EVENT_FRONT_BLOCKED;
-          break;
-        }
-      } else if (us_poll_target == 1) {
-        if (ultrasonic_read(_US_RIGHT) > WALL_DETECT_CM) {
-          detected_event = _MAZE_EVENT_RIGHT_OPEN;
-          break;
-        }
-      } else {
-        if (ultrasonic_read(_US_LEFT) > WALL_DETECT_CM) {
-          detected_event = _MAZE_EVENT_LEFT_OPEN;
-          break;
-        }
-      }
-
-      us_poll_target = (us_poll_target + 1) % 3;
-    }
-
-    //  PID Straight-Line Control
-    int32_t error = (int32_t)(current_left - start_left) -
-                    (int32_t)(current_right - start_right);
-    int32_t correction = (int32_t)(Kp * (float)error);
-
-    motor_set_speed(_MOTOR_L, BASE_SPEED - correction);
-    motor_set_speed(_MOTOR_R, BASE_SPEED + correction);
-
-    HAL_Delay(1);
-  }
-
-  // Halt motors instantly upon event detection
-  motor_set_dir(_MOTOR_L, _DIR_BRAKE);
-  motor_set_dir(_MOTOR_R, _DIR_BRAKE);
-  motor_set_speed(_MOTOR_L, 0);
-  motor_set_speed(_MOTOR_R, 0);
-  HAL_Delay(100);
-  motor_set_dir(_MOTOR_L, _DIR_COAST);
-  motor_set_dir(_MOTOR_R, _DIR_COAST);
-
-  // Final solved verification (delay to let acoustics clear)
-  HAL_Delay(50);
-  if (ultrasonic_read(_US_FRONT) >= 40 && ultrasonic_read(_US_RIGHT) >= 40 &&
-      ultrasonic_read(_US_LEFT) >= 40) {
-    return _MAZE_EVENT_SOLVED;
-  }
-
-  return detected_event;
-}
-
-/**
- * @brief Drives forward using dynamic ultrasonic PID centering.
- *        Adapts to varying corridor widths automatically.
- */
-maze_event_e drive_to_intersection_2(void) {
   uint32_t start_left = encoder_get_total(_ENC_LEFT);
   uint32_t start_right = encoder_get_total(_ENC_RIGHT);
 
   uint32_t last_left_count = start_left;
   uint32_t last_right_count = start_right;
+
   uint32_t last_movement_time = HAL_GetTick();
+
   const uint32_t STALL_TIMEOUT_MS = 500;
+  const uint32_t BASE_SPEED = 400;
 
   motor_set_dir(_MOTOR_L, _DIR_FORWARD);
   motor_set_dir(_MOTOR_R, _DIR_FORWARD);
 
-  const uint32_t BASE_SPEED = 400;
-  const float Kp_enc = 30.0f;
-  const float Kp_center = 20.0f;
-
-  const uint32_t OPENING_THRESHOLD_CM = 35;
-
-  // RESTORED: 5cm puts the 8cm axle perfectly at the 13cm center mark
-  const uint32_t STOP_DISTANCE_CM = 5;
-
-  static int32_t dynamic_ideal_dist = 10;
-
+  // Seed with "unknown/far" so the very first control tick still runs a
+  // centering pass instead of a blind one, on stale-but-safe defaults.
   uint32_t latest_front_us = 999;
-  uint32_t latest_right_us = 999;
   uint32_t latest_left_us = 999;
-
+  uint32_t latest_right_us = 999;
   uint32_t last_us_check = HAL_GetTick();
-  uint8_t us_poll_target = 0;
-  maze_event_e detected_event = _MAZE_EVENT_ERROR;
+  uint8_t us_poll_target = 0; // 0: front (safety), 1: left, 2: right
 
   while (1) {
+
     uint32_t now = HAL_GetTick();
 
     uint32_t current_left = encoder_get_total(_ENC_LEFT);
     uint32_t current_right = encoder_get_total(_ENC_RIGHT);
 
+    uint32_t delta_left = current_left - start_left;
+    uint32_t delta_right = current_right - start_right;
+
+    // Stall watchdog
     if (current_left != last_left_count || current_right != last_right_count) {
       last_left_count = current_left;
       last_right_count = current_right;
       last_movement_time = now;
     }
-    if (now - last_movement_time > STALL_TIMEOUT_MS)
+
+    if (now - last_movement_time > STALL_TIMEOUT_MS) {
       Error_Handler();
+    }
+    if (delta_left >= target_pulses && delta_right >= target_pulses) {
+      break;
+    }
+
+    // Round-robin polling: front (crash safety) + both side walls.
+    if (now - last_us_check >= 10) {
+      last_us_check = now;
+      if (us_poll_target == 0) {
+        latest_front_us = ultrasonic_read(_US_FRONT);
+        if (latest_front_us <= CRASH_SAFETY_CM) {
+          break; // Emergency stop, short of target.
+        }
+      } else if (us_poll_target == 1) {
+        latest_left_us = ultrasonic_read(_US_LEFT);
+      } else {
+        latest_right_us = ultrasonic_read(_US_RIGHT);
+      }
+      us_poll_target = (us_poll_target + 1) % 3;
+    }
+
+    int32_t correction = compute_centering_correction(
+        latest_left_us, latest_right_us, delta_left, delta_right);
+
+    int32_t left_speed = (int32_t)BASE_SPEED - correction;
+    int32_t right_speed = (int32_t)BASE_SPEED + correction;
+
+    // Let the near-finished wheel coast so it doesn't overshoot the target.
+    if (delta_left >= target_pulses) {
+      left_speed = 0;
+    }
+    if (delta_right >= target_pulses) {
+      right_speed = 0;
+    }
+
+    motor_set_speed(_MOTOR_L, left_speed);
+    motor_set_speed(_MOTOR_R, right_speed);
+    HAL_Delay(1);
+  }
+
+  motor_set_dir(_MOTOR_L, _DIR_BRAKE);
+  motor_set_dir(_MOTOR_R, _DIR_BRAKE);
+
+  motor_set_speed(_MOTOR_L, 0);
+  motor_set_speed(_MOTOR_R, 0);
+
+  HAL_Delay(100);
+
+  motor_set_dir(_MOTOR_L, _DIR_COAST);
+  motor_set_dir(_MOTOR_R, _DIR_COAST);
+}
+
+/**
+ * @brief Advances into the new corridor right after a turn, actively
+ *        centering/squaring from tick 0 (no blind phase) until the preferred
+ *        wall is reacquired or a front wall is hit. This is what fixes the
+ *        post-turn wall collision: the old version only ran encoder
+ *        cross-track PID here, which does not correct for the small heading
+ *        error left over from the turn.
+ * @param pref_dir The wall we are trying to re-engage (_TURN_RIGHT or
+ * _TURN_LEFT).
+ */
+
+void drive_reacquire_corridor(turn_dir_e pref_dir) {
+
+  // @Patch: needs to be solved: as maze is know; moving car forward to reduce reacuire corridor 
+  // moves car forward to its halg lenght distance
+  drive_guided(8);
+  // Pause briefly to let the chassis settle and prevent gyro motion artifacts
+  HAL_Delay(500);
+
+  uint32_t start_left = encoder_get_total(_ENC_LEFT);
+  uint32_t start_right = encoder_get_total(_ENC_RIGHT);
+
+  uint32_t last_left_count = start_left;
+  uint32_t last_right_count = start_right;
+  uint32_t last_movement_time = HAL_GetTick();
+
+  const uint32_t STALL_TIMEOUT_MS = 500;
+  const uint32_t BASE_SPEED = 400;
+  const uint32_t REENGAGE_THRESHOLD_CM = 20; // Matches OPENING_THRESHOLD_CM
+  const uint32_t STOP_DISTANCE_CM = 6;
+
+  ultrasonic_e pref_sensor = (pref_dir == _TURN_RIGHT) ? _US_RIGHT : _US_LEFT;
+
+  motor_set_dir(_MOTOR_L, _DIR_FORWARD);
+  motor_set_dir(_MOTOR_R, _DIR_FORWARD);
+
+  uint32_t latest_front_us = 999;
+  uint32_t latest_left_us = 999;
+  uint32_t latest_right_us = 999;
+  uint32_t last_us_check = HAL_GetTick();
+  uint8_t us_poll_target = 0; // 0: front, 1: left, 2: right
+
+  while (1) {
+
+    uint32_t now = HAL_GetTick();
+
+    uint32_t current_left = encoder_get_total(_ENC_LEFT);
+    uint32_t current_right = encoder_get_total(_ENC_RIGHT);
+    uint32_t delta_left = current_left - start_left;
+    uint32_t delta_right = current_right - start_right;
+
+    if (current_left != last_left_count || current_right != last_right_count) {
+
+      last_left_count = current_left;
+      last_right_count = current_right;
+      last_movement_time = now;
+    }
+
+    if (now - last_movement_time > STALL_TIMEOUT_MS) {
+      Error_Handler();
+    }
 
     if (now - last_us_check >= 10) {
       last_us_check = now;
@@ -1066,16 +1020,118 @@ maze_event_e drive_to_intersection_2(void) {
       if (us_poll_target == 0) {
         latest_front_us = ultrasonic_read(_US_FRONT);
         if (latest_front_us <= STOP_DISTANCE_CM) {
+          break; // T-junction / dead end reached before wall reappeared.
+        }
+
+      } else if (us_poll_target == 1) {
+        latest_left_us = ultrasonic_read(_US_LEFT);
+
+      } else {
+        latest_right_us = ultrasonic_read(_US_RIGHT);
+      }
+      us_poll_target = (us_poll_target + 1) % 3;
+    }
+
+    uint32_t pref_us =
+        (pref_sensor == _US_LEFT) ? latest_left_us : latest_right_us;
+
+    if (pref_us < REENGAGE_THRESHOLD_CM) {
+      break; // Preferred wall reacquired; squared and centered.
+    }
+
+    int32_t correction = compute_centering_correction(
+
+        latest_left_us, latest_right_us, delta_left, delta_right);
+
+    motor_set_speed(_MOTOR_L, BASE_SPEED - correction);
+    motor_set_speed(_MOTOR_R, BASE_SPEED + correction);
+    HAL_Delay(1);
+  }
+
+  motor_set_dir(_MOTOR_L, _DIR_BRAKE);
+  motor_set_dir(_MOTOR_R, _DIR_BRAKE);
+  motor_set_speed(_MOTOR_L, 0);
+  motor_set_speed(_MOTOR_R, 0);
+  HAL_Delay(100);
+  motor_set_dir(_MOTOR_L, _DIR_COAST);
+  motor_set_dir(_MOTOR_R, _DIR_COAST);
+}
+
+/**
+ * @brief Drives forward using dynamic ultrasonic PID centering with a deadband.
+ */
+
+maze_event_e drive_to_intersection(void) {
+
+  uint32_t start_left = encoder_get_total(_ENC_LEFT);
+  uint32_t start_right = encoder_get_total(_ENC_RIGHT);
+
+  uint32_t last_left_count = start_left;
+  uint32_t last_right_count = start_right;
+
+  uint32_t last_movement_time = HAL_GetTick();
+
+  const uint32_t STALL_TIMEOUT_MS = 500;
+
+  motor_set_dir(_MOTOR_L, _DIR_FORWARD);
+  motor_set_dir(_MOTOR_R, _DIR_FORWARD);
+
+  const uint32_t BASE_SPEED = 450;
+  const uint32_t OPENING_THRESHOLD_CM = 20; // Threshold indicating an open path
+  const uint32_t STOP_DISTANCE_CM = 5;      // Front wall stopping distance
+
+  uint32_t latest_front_us = 999;
+  uint32_t latest_right_us = 999;
+  uint32_t latest_left_us = 999;
+
+  uint32_t last_us_check = HAL_GetTick();
+  uint8_t us_poll_target = 0;
+
+  maze_event_e detected_event = _MAZE_EVENT_ERROR;
+
+  while (1) {
+
+    uint32_t now = HAL_GetTick();
+
+    uint32_t current_left = encoder_get_total(_ENC_LEFT);
+    uint32_t current_right = encoder_get_total(_ENC_RIGHT);
+
+    //  Stall-Detecting Software Watchdog
+
+    if (current_left != last_left_count || current_right != last_right_count) {
+
+      last_left_count = current_left;
+      last_right_count = current_right;
+      last_movement_time = now;
+    }
+
+    if (now - last_movement_time > STALL_TIMEOUT_MS) {
+      Error_Handler();
+    }
+
+    // Environmental Polling (Round-robin)
+
+    if (now - last_us_check >= 5) {
+      last_us_check = now;
+
+      if (us_poll_target == 0) {
+
+        latest_front_us = ultrasonic_read(_US_FRONT);
+
+        if (latest_front_us <= STOP_DISTANCE_CM) {
           detected_event = _MAZE_EVENT_FRONT_BLOCKED;
           break;
         }
+
       } else if (us_poll_target == 1) {
         latest_right_us = ultrasonic_read(_US_RIGHT);
+
         if (latest_right_us > OPENING_THRESHOLD_CM &&
             (current_left - start_left) > 5) {
           detected_event = _MAZE_EVENT_RIGHT_OPEN;
           break;
         }
+
       } else {
         latest_left_us = ultrasonic_read(_US_LEFT);
         if (latest_left_us > OPENING_THRESHOLD_CM &&
@@ -1087,43 +1143,27 @@ maze_event_e drive_to_intersection_2(void) {
       us_poll_target = (us_poll_target + 1) % 3;
     }
 
-    int32_t correction = 0;
-
-    if (latest_left_us < OPENING_THRESHOLD_CM &&
-        latest_right_us < OPENING_THRESHOLD_CM) {
-      dynamic_ideal_dist = (latest_left_us + latest_right_us) / 2;
-      int32_t center_error = (int32_t)latest_left_us - (int32_t)latest_right_us;
-      correction = (int32_t)(Kp_center * (float)center_error);
-    } else if (latest_left_us < OPENING_THRESHOLD_CM) {
-      int32_t center_error = (int32_t)latest_left_us - dynamic_ideal_dist;
-      correction = (int32_t)(Kp_center * (float)center_error);
-    } else if (latest_right_us < OPENING_THRESHOLD_CM) {
-      int32_t center_error = dynamic_ideal_dist - (int32_t)latest_right_us;
-      correction = (int32_t)(Kp_center * (float)center_error);
-    } else {
-      int32_t enc_error = (int32_t)(current_left - start_left) -
-                          (int32_t)(current_right - start_right);
-      correction = (int32_t)(Kp_enc * (float)enc_error);
-    }
+    //  Centering PID with dynamic corridor tracking + deadband (shared law)
+    int32_t correction = compute_centering_correction(
+        latest_left_us, latest_right_us, current_left - start_left,
+        current_right - start_right);
 
     motor_set_speed(_MOTOR_L, BASE_SPEED - correction);
     motor_set_speed(_MOTOR_R, BASE_SPEED + correction);
     HAL_Delay(1);
   }
 
+  // Active Braking
   motor_set_dir(_MOTOR_L, _DIR_BRAKE);
   motor_set_dir(_MOTOR_R, _DIR_BRAKE);
+
   motor_set_speed(_MOTOR_L, 0);
   motor_set_speed(_MOTOR_R, 0);
+
   HAL_Delay(100);
+
   motor_set_dir(_MOTOR_L, _DIR_COAST);
   motor_set_dir(_MOTOR_R, _DIR_COAST);
-
-  HAL_Delay(50);
-  if (ultrasonic_read(_US_FRONT) >= 50 && ultrasonic_read(_US_RIGHT) >= 50 &&
-      ultrasonic_read(_US_LEFT) >= 50) {
-    return _MAZE_EVENT_SOLVED;
-  }
 
   return detected_event;
 }
@@ -1132,42 +1172,38 @@ maze_event_e drive_to_intersection_2(void) {
  * @brief Universal wall follower step.
  * @param pref_dir The wall to track (_TURN_RIGHT or _TURN_LEFT).
  */
+
 void algo_wall_follower_step(turn_dir_e pref_dir) {
-  // CORRECTED: Drives axle 20cm forward to reach the dead center of the
-  // intersection
-  const uint32_t PIVOT_OFFSET_PULSES = 20;
 
-  // Increased to 20cm to ensure the car doesn't falsely detect the corner
-  // it is currently rotating around as a "wall" blocking its path.
-  const uint32_t WALL_DETECT_CM = 20;
-
+  const uint32_t WALL_DETECT_CM = 20; // Secondary check threshold
   turn_dir_e opp_dir = (pref_dir == _TURN_RIGHT) ? _TURN_LEFT : _TURN_RIGHT;
   ultrasonic_e pref_sensor = (pref_dir == _TURN_RIGHT) ? _US_RIGHT : _US_LEFT;
   ultrasonic_e opp_sensor = (pref_dir == _TURN_RIGHT) ? _US_LEFT : _US_RIGHT;
-
   maze_event_e event = drive_to_intersection();
 
   if (event == _MAZE_EVENT_SOLVED) {
+
     while (1) {
       HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
       HAL_Delay(100);
     }
   }
 
+  //  Passing an Open Intersection
   if ((pref_sensor == _US_RIGHT && event == _MAZE_EVENT_RIGHT_OPEN) ||
       (pref_sensor == _US_LEFT && event == _MAZE_EVENT_LEFT_OPEN)) {
-
-    drive_dist(PIVOT_OFFSET_PULSES, _DIR_FORWARD);
     turn_in_place(90.0f, pref_dir);
-    drive_until_wall_reengaged(pref_dir);
-  } else if (event == _MAZE_EVENT_FRONT_BLOCKED) {
+    drive_reacquire_corridor(pref_dir);
+  }
 
+  //  Approaching a Corner / Dead End
+  else if (event == _MAZE_EVENT_FRONT_BLOCKED) {
     if (ultrasonic_read(pref_sensor) > WALL_DETECT_CM) {
       turn_in_place(90.0f, pref_dir);
-      drive_until_wall_reengaged(pref_dir);
+      drive_reacquire_corridor(pref_dir);
     } else if (ultrasonic_read(opp_sensor) > WALL_DETECT_CM) {
       turn_in_place(90.0f, opp_dir);
-      drive_until_wall_reengaged(opp_dir);
+      drive_reacquire_corridor(opp_dir);
     } else {
       turn_in_place(180.0f, pref_dir);
     }
@@ -1178,7 +1214,9 @@ void algo_wall_follower_step(turn_dir_e pref_dir) {
  * @brief Top-level router for the active maze-solving strategy.
  * @param active_algo The selected routing algorithm.
  */
+
 void maze_solve_step(maze_algo_e active_algo) {
+
   switch (active_algo) {
   case _ALGO_RIGHT_WALL:
     algo_wall_follower_step(_TURN_RIGHT);
@@ -1189,6 +1227,7 @@ void maze_solve_step(maze_algo_e active_algo) {
   case _ALGO_FLOOD_FILL:
     // future_flood_fill_step();
     break;
+
   default:
     Error_Handler();
     break;
