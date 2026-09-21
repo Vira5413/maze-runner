@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include "mpu6050.h"
 #include <math.h>
+#include <stdlib.h>
 
 /* USER CODE END Includes */
 
@@ -156,7 +157,7 @@ uint32_t ultrasonic_read(ultrasonic_e sensor);
 static int32_t compute_centering_correction(uint32_t left_us, uint32_t right_us,
                                             uint32_t enc_left_delta,
                                             uint32_t enc_right_delta);
-void drive_guided(uint32_t target_pulses);
+void drive_guided(uint32_t target_pulses, motor_dir_e dir);
 void drive_reacquire_corridor(turn_dir_e pref_dir);
 
 void drive_dist(uint32_t target_pulses, motor_dir_e dir);
@@ -659,15 +660,13 @@ void drive_dist(uint32_t target_pulses, motor_dir_e dir) {
     int32_t right_speed = BASE_SPEED + correction;
 
     // If one wheel finishes early, stop it while the other catches up
-    if (current_left >= target_pulses){
+    if (current_left >= target_pulses) {
       left_speed = 0;
     }
 
-
-    if (current_right >= target_pulses){
+    if (current_right >= target_pulses) {
       right_speed = 0;
     }
-
 
     motor_set_speed(_MOTOR_L, left_speed);
     motor_set_speed(_MOTOR_R, right_speed);
@@ -702,7 +701,7 @@ void turn_in_place(float target_angle_deg, turn_dir_e dir) {
   // Advance half the body length (8cm) to prevent bumper clipping during
   // rotation. 8 cm / 1.021 cm/pulse = ~8 pulses. Guided (not blind) so the
   // car stays centered right up to the pivot point.
-  drive_guided(8);
+  drive_guided(8, _DIR_FORWARD);
   // Pause briefly to let the chassis settle and prevent gyro motion artifacts
   HAL_Delay(500);
 
@@ -721,7 +720,7 @@ void turn_in_place(float target_angle_deg, turn_dir_e dir) {
   const uint32_t MAX_SPEED = 500;
 
   const float Kp_angle = 5.0f; // Proportional gain for deceleration
-  const float Kp_enc = 30.0f; // Proportional gain for wheel speed matching
+  const float Kp_enc = 30.0f;  // Proportional gain for wheel speed matching
 
   // Set opposite wheel directions for a zero-radius turn
   if (dir == _TURN_RIGHT) {
@@ -758,11 +757,11 @@ void turn_in_place(float target_angle_deg, turn_dir_e dir) {
 
       uint32_t base_speed = (uint32_t)(angle_remaining * Kp_angle);
 
-      if (base_speed > MAX_SPEED){
+      if (base_speed > MAX_SPEED) {
         base_speed = MAX_SPEED;
       }
 
-      if (base_speed < MIN_SPEED){
+      if (base_speed < MIN_SPEED) {
         base_speed = MIN_SPEED;
       }
 
@@ -794,7 +793,6 @@ void turn_in_place(float target_angle_deg, turn_dir_e dir) {
   // resistance
   motor_set_dir(_MOTOR_L, _DIR_COAST);
   motor_set_dir(_MOTOR_R, _DIR_COAST);
-
 }
 
 /**
@@ -804,15 +802,18 @@ void turn_in_place(float target_angle_deg, turn_dir_e dir) {
  *        are seen, so single-wall tracking uses a fresh half-width instead of
  *        a hardcoded guess.
  */
-static int32_t compute_centering_correction(uint32_t left_us, uint32_t right_us,
-                                            uint32_t enc_left_delta,
-                                            uint32_t enc_right_delta) {
+
+
+static int32_t compute_centering_correction(uint32_t left_us,
+                                              uint32_t right_us,
+                                              uint32_t enc_left_delta,
+                                              uint32_t enc_right_delta) {
 
   const uint32_t OPENING_THRESHOLD_CM = 20;
   const int32_t DEADBAND_CM = 2;
 
-  const float Kp_center = 30.0f;
-  const float Kp_enc = 30.0f;
+  const float Kp_center = 20.0f;
+  const float Kp_enc = 15.0f;
 
   int32_t center_error = 0;
   uint8_t use_encoder_pid = 0;
@@ -853,7 +854,7 @@ static int32_t compute_centering_correction(uint32_t left_us, uint32_t right_us,
  * @param target_pulses Distance to travel, in encoder ticks. 0 = no-op.
  */
 
-void drive_guided(uint32_t target_pulses) {
+void drive_guided(uint32_t target_pulses, motor_dir_e dir) {
 
   if (target_pulses == 0)
 
@@ -870,8 +871,8 @@ void drive_guided(uint32_t target_pulses) {
   const uint32_t STALL_TIMEOUT_MS = 500;
   const uint32_t BASE_SPEED = 400;
 
-  motor_set_dir(_MOTOR_L, _DIR_FORWARD);
-  motor_set_dir(_MOTOR_R, _DIR_FORWARD);
+  motor_set_dir(_MOTOR_L, dir);
+  motor_set_dir(_MOTOR_R, dir);
 
   // Seed with "unknown/far" so the very first control tick still runs a
   // centering pass instead of a blind one, on stale-but-safe defaults.
@@ -965,9 +966,9 @@ void drive_guided(uint32_t target_pulses) {
 
 void drive_reacquire_corridor(turn_dir_e pref_dir) {
 
-  // @Patch: needs to be solved: as maze is know; moving car forward to reduce reacuire corridor 
-  // moves car forward to its halg lenght distance
-  drive_guided(8);
+  // @Patch: needs to be solved: as maze is know; moving car forward to reduce
+  // reacuire corridor moves car forward to its halg lenght distance
+  drive_guided(8, _DIR_FORWARD);
   // Pause briefly to let the chassis settle and prevent gyro motion artifacts
   HAL_Delay(500);
 
@@ -981,7 +982,7 @@ void drive_reacquire_corridor(turn_dir_e pref_dir) {
   const uint32_t STALL_TIMEOUT_MS = 500;
   const uint32_t BASE_SPEED = 400;
   const uint32_t REENGAGE_THRESHOLD_CM = 20; // Matches OPENING_THRESHOLD_CM
-  const uint32_t STOP_DISTANCE_CM = 6;
+  const uint32_t STOP_DISTANCE_CM = 5;
 
   ultrasonic_e pref_sensor = (pref_dir == _TURN_RIGHT) ? _US_RIGHT : _US_LEFT;
 
@@ -1078,7 +1079,8 @@ maze_event_e drive_to_intersection(void) {
 
   const uint32_t BASE_SPEED = 450;
   const uint32_t OPENING_THRESHOLD_CM = 20; // Threshold indicating an open path
-  const uint32_t STOP_DISTANCE_CM = 5;      // Front wall stopping distance
+  const uint32_t GOAL_OPENING_THRESHOLD_CM = 25; // Threshold for open goal zone
+  const uint32_t STOP_DISTANCE_CM = 5;           // Front wall stopping distance
 
   uint32_t latest_front_us = 999;
   uint32_t latest_right_us = 999;
@@ -1140,6 +1142,17 @@ maze_event_e drive_to_intersection(void) {
           break;
         }
       }
+
+      // --- GOAL CHECK ---
+      // Evaluated continuously once sensors update to catch open target zones
+      if ((current_left - start_left) > 5 &&
+          latest_front_us > GOAL_OPENING_THRESHOLD_CM &&
+          latest_left_us > GOAL_OPENING_THRESHOLD_CM &&
+          latest_right_us > GOAL_OPENING_THRESHOLD_CM) {
+        detected_event = _MAZE_EVENT_SOLVED;
+        break;
+      }
+
       us_poll_target = (us_poll_target + 1) % 3;
     }
 
