@@ -703,7 +703,7 @@ void turn_in_place(float target_angle_deg, turn_dir_e dir) {
   // car stays centered right up to the pivot point.
   drive_guided(8, _DIR_FORWARD);
   // Pause briefly to let the chassis settle and prevent gyro motion artifacts
-  HAL_Delay(500);
+  HAL_Delay(100);
 
   float turn_sum = 0.0f;
 
@@ -803,17 +803,15 @@ void turn_in_place(float target_angle_deg, turn_dir_e dir) {
  *        a hardcoded guess.
  */
 
-
-static int32_t compute_centering_correction(uint32_t left_us,
-                                              uint32_t right_us,
-                                              uint32_t enc_left_delta,
-                                              uint32_t enc_right_delta) {
+static int32_t compute_centering_correction(uint32_t left_us, uint32_t right_us,
+                                            uint32_t enc_left_delta,
+                                            uint32_t enc_right_delta) {
 
   const uint32_t OPENING_THRESHOLD_CM = 20;
-  const int32_t DEADBAND_CM = 2;
+  const int32_t DEADBAND_CM = 1;
 
   const float Kp_center = 20.0f;
-  const float Kp_enc = 15.0f;
+  const float Kp_enc = 30.0f;
 
   int32_t center_error = 0;
   uint8_t use_encoder_pid = 0;
@@ -1078,8 +1076,8 @@ maze_event_e drive_to_intersection(void) {
   motor_set_dir(_MOTOR_R, _DIR_FORWARD);
 
   const uint32_t BASE_SPEED = 450;
-  const uint32_t OPENING_THRESHOLD_CM = 20; // Threshold indicating an open path
-  const uint32_t GOAL_OPENING_THRESHOLD_CM = 25; // Threshold for open goal zone
+  const uint32_t OPENING_THRESHOLD_CM = 15; // Threshold indicating an open path
+  const uint32_t GOAL_OPENING_THRESHOLD_CM = 20; // Threshold for open goal zone
   const uint32_t STOP_DISTANCE_CM = 5;           // Front wall stopping distance
 
   uint32_t latest_front_us = 999;
@@ -1113,7 +1111,7 @@ maze_event_e drive_to_intersection(void) {
 
     // Environmental Polling (Round-robin)
 
-    if (now - last_us_check >= 5) {
+    if (now - last_us_check >= 10) {
       last_us_check = now;
 
       if (us_poll_target == 0) {
@@ -1143,17 +1141,17 @@ maze_event_e drive_to_intersection(void) {
         }
       }
 
-      // --- GOAL CHECK ---
-      // Evaluated continuously once sensors update to catch open target zones
-      if ((current_left - start_left) > 5 &&
-          latest_front_us > GOAL_OPENING_THRESHOLD_CM &&
-          latest_left_us > GOAL_OPENING_THRESHOLD_CM &&
-          latest_right_us > GOAL_OPENING_THRESHOLD_CM) {
-        detected_event = _MAZE_EVENT_SOLVED;
-        break;
-      }
-
       us_poll_target = (us_poll_target + 1) % 3;
+    }
+
+    // --- GOAL CHECK ---
+    // Evaluated continuously once sensors update to catch open target zones
+    if ((current_left - start_left) > 5 &&
+        latest_front_us > GOAL_OPENING_THRESHOLD_CM &&
+        latest_left_us > GOAL_OPENING_THRESHOLD_CM &&
+        latest_right_us > GOAL_OPENING_THRESHOLD_CM) {
+      detected_event = _MAZE_EVENT_SOLVED;
+      break;
     }
 
     //  Centering PID with dynamic corridor tracking + deadband (shared law)
